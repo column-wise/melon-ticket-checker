@@ -13,19 +13,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-CONFIG_FILE = Path("config.json")
-COOKIES_FILE = Path("cookies.json")
+SLACK_CONFIG_FILE = Path("slack_config.json")
+TARGET_FILE = Path("target.json")
 
 API_URL = "https://ticket.melon.com/tktapi/product/seatStateInfo.json"
 CALLBACK = "melonChecker"
-
-FORM_DATA = {
-    "prodId": "212811",
-    "scheduleNo": "100003",
-    "seatId": "5_0",
-    "volume": "1",
-    "selectedGradeVolume": "1",
-}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
@@ -44,19 +36,25 @@ HEADERS = {
 }
 
 
-def load_config():
-    if not CONFIG_FILE.exists():
-        raise FileNotFoundError("config.json 없음. config.json을 먼저 만들어주세요.")
-    cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    if not cfg.get("slack_webhook_url"):
-        raise ValueError("config.json에 slack_webhook_url을 입력해주세요.")
+def load_slack_config():
+    if not SLACK_CONFIG_FILE.exists():
+        raise FileNotFoundError("slack_config.json 없음. slack_config.json을 먼저 만들어주세요.")
+    cfg = json.loads(SLACK_CONFIG_FILE.read_text(encoding="utf-8"))
+    if not cfg.get("webhook_url"):
+        raise ValueError("slack_config.json에 webhook_url을 입력해주세요.")
     return cfg
 
 
-def load_cookies():
-    if not COOKIES_FILE.exists():
-        raise FileNotFoundError("cookies.json 없음. 브라우저에서 쿠키를 내보내주세요.")
-    return json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
+def load_target():
+    if not TARGET_FILE.exists():
+        raise FileNotFoundError("target.json 없음. 공연 정보와 쿠키를 입력해주세요.")
+    data = json.loads(TARGET_FILE.read_text(encoding="utf-8"))
+    for key in ("prodId", "scheduleNo", "seatId"):
+        if not data.get(key):
+            raise ValueError(f"target.json에 {key} 값이 없습니다.")
+    if not data.get("cookies"):
+        raise ValueError("target.json에 cookies가 없습니다.")
+    return data
 
 
 def parse_response(text):
@@ -75,15 +73,23 @@ def send_slack(webhook_url, message):
         log.error(f"슬랙 전송 실패: {e}")
 
 
-def check_ticket(cookies, webhook_url):
+def check_ticket(target, webhook_url):
     session = requests.Session()
-    session.cookies.update(cookies)
+    session.cookies.update(target["cookies"])
+
+    form_data = {
+        "prodId": target["prodId"],
+        "scheduleNo": target["scheduleNo"],
+        "seatId": target["seatId"],
+        "volume": target.get("volume", "1"),
+        "selectedGradeVolume": target.get("selectedGradeVolume", "1"),
+    }
 
     try:
         resp = session.post(
             API_URL,
             params={"v": "1", "callback": CALLBACK},
-            data=FORM_DATA,
+            data=form_data,
             headers=HEADERS,
             timeout=15,
         )
@@ -95,13 +101,12 @@ def check_ticket(cookies, webhook_url):
 
         log.info(f"rmdSeatCnt={cnt}  chkResult={chk}")
 
-        # 세션 만료 감지: chkResult가 음수이거나 응답에 로그인 관련 내용이 포함된 경우
         if chk < 0 or "login" in resp.text.lower():
             log.warning("세션 만료 감지")
             send_slack(
                 webhook_url,
                 "⚠️ 멜론티켓 세션이 만료되었습니다.\n"
-                "cookies.json을 브라우저에서 다시 내보내서 교체해주세요.",
+                "target.json의 cookies를 브라우저에서 다시 내보내서 교체해주세요.",
             )
             return "session_expired"
 
@@ -109,7 +114,7 @@ def check_ticket(cookies, webhook_url):
             send_slack(
                 webhook_url,
                 f"🎫 취소표 발생! *{cnt}매* 예매 가능!\n"
-                f"https://ticket.melon.com/performance/index.htm?prodId=212811",
+                f"https://ticket.melon.com/performance/index.htm?prodId={target['prodId']}",
             )
             log.info(f"취소표 감지: {cnt}매")
             return "available"
@@ -118,7 +123,7 @@ def check_ticket(cookies, webhook_url):
             send_slack(
                 webhook_url,
                 f"⚡ chkResult={chk} 감지! 상태 변화 가능성 있음.\n"
-                f"https://ticket.melon.com/performance/index.htm?prodId=212811",
+                f"https://ticket.melon.com/performance/index.htm?prodId={target['prodId']}",
             )
             log.info(f"chkResult 양수 감지: {chk}")
             return "chk_positive"
@@ -131,8 +136,8 @@ def check_ticket(cookies, webhook_url):
 
 
 def main():
-    config = load_config()
-    webhook_url = config["slack_webhook_url"]
+    slack = load_slack_config()
+    webhook_url = slack["webhook_url"]
 
     log.info("티켓 체커 시작 (20~40초 랜덤 간격)")
     send_slack(webhook_url, "🔍 멜론티켓 취소표 모니터링 시작")
@@ -141,12 +146,12 @@ def main():
 
     while True:
         try:
-            cookies = load_cookies()
-        except FileNotFoundError as e:
+            target = load_target()
+        except (FileNotFoundError, ValueError) as e:
             log.error(str(e))
             break
 
-        result = check_ticket(cookies, webhook_url)
+        result = check_ticket(target, webhook_url)
 
         if result == "error":
             consecutive_errors += 1

@@ -1,5 +1,6 @@
-cookies.json
-config.json
+slack_config.json
+target.json
 __pycache__/
 *.pyc
 .env
+.claude/
